@@ -1,0 +1,61 @@
+# .NET Aliases
+alias d=dotnet
+alias db="dotnet build"
+alias dw="dotnet watch"
+alias dr="dotnet run"
+alias dt="dotnet test"
+alias c="clear"
+alias q="exit"
+
+# Git Aliases
+alias gs="git status"
+alias ga="git add"
+alias gc="git commit"
+alias gp="git push"
+alias gl="git log --oneline --graph --decorate"
+
+# Modern CLI Replacements
+alias ls="eza -lh --color=auto --icons=auto --group-directories-first --git"
+alias la="eza -lha --color=auto --icons=auto --group-directories-first"
+alias lt="eza -a --tree --level=3 --long --icons --git"
+alias grep="grep --color=auto"
+alias cat='bat --paging=never'
+alias less='bat --style=plain'
+alias path='echo -e ${PATH//:/\\n}'
+
+alias zshconfig="micro ~/.zshrc"
+alias zshreload="source ~/.zshrc"
+
+# Multi-Distro Package Management Aliases
+if command -v apt-get >/dev/null 2>&1; then
+    alias aptupd="sudo apt update && sudo apt upgrade -y"
+    alias aptclean="sudo apt autoremove -y && sudo apt clean"
+    alias aptin="sudo apt install -y"
+    alias aptrm="sudo apt remove -y"
+    alias aptsearch="apt search"
+fi
+
+if command -v dnf >/dev/null 2>&1; then
+    alias dnfupd="sudo dnf upgrade --refresh"
+    alias dnfclean="sudo dnf clean all"
+    alias dnfin="sudo dnf install -y"
+    alias dnfrm="sudo dnf remove -y"
+fi
+
+if command -v pacman >/dev/null 2>&1; then
+    alias pacupd="sudo pacman -Syu"
+    alias pacclean="sudo pacman -Sc"
+    alias pacin="sudo pacman -S"
+    alias pacrm="sudo pacman -Rns"
+    alias pacsearch="pacman -Ss"
+    if command -v yay >/dev/null 2>&1; then
+        alias yaupd="yay -Syu"
+        alias yain="yay -S"
+    elif command -v paru >/dev/null 2>&1; then
+        alias yaupd="paru -Syu"
+        alias yain="paru -S"
+    fi
+fi
+
+# Universal system update alias across all distros
+alias upd='command -v yay >/dev/null 2>&1 && yay -Syu || (command -v paru >/dev/null 2>&1 && paru -Syu) || (command -v dnf >/dev/null 2>&1 && sudo dnf upgrade --refresh) || (command -v apt >/dev/null 2>&1 && sudo apt update && sudo apt upgrade -y) || (command -v pacman >/dev/null 2>&1 && sudo pacman -Syu)'

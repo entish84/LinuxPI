@@ -1,0 +1,81 @@
+# Starship Modern Prompt Configuration
+add_newline = true
+scan_timeout = 30
+
+format = """
+$directory\
+$git_branch\
+$git_status\
+$fill\
+$dotnet\
+$nodejs\
+$rust\
+$python\
+$golang\
+$java\
+$docker_context\
+$cmd_duration\
+$line_break\
+$character"""
+
+[character]
+success_symbol = "[❯](bold green)"
+error_symbol = "[❯](bold red)"
+vimcmd_symbol = "[❮](bold yellow)"
+
+[directory]
+style = "bold cyan"
+truncation_length = 4
+truncate_to_repo = true
+read_only = " 󰌾"
+
+[git_branch]
+symbol = " "
+style = "bold purple"
+
+[git_status]
+style = "bold red"
+format = '([$all_status$ahead_behind]($style) )'
+
+[fill]
+symbol = " "
+
+[dotnet]
+symbol = "󰌛 "
+style = "bold blue"
+format = "[$symbol($version )]($style)"
+
+[nodejs]
+symbol = "󰎙 "
+style = "bold green"
+format = "[$symbol($version )]($style)"
+
+[rust]
+symbol = "󱘗 "
+style = "bold red"
+format = "[$symbol($version )]($style)"
+
+[python]
+symbol = "󰌠 "
+style = "bold yellow"
+format = "[$symbol($version )]($style)"
+
+[golang]
+symbol = "󰟓 "
+style = "bold cyan"
+format = "[$symbol($version )]($style)"
+
+[java]
+symbol = "󰬷 "
+style = "bold red"
+format = "[$symbol($version )]($style)"
+
+[docker_context]
+symbol = "󰡨 "
+style = "bold blue"
+format = "[$symbol$context]($style) "
+
+[cmd_duration]
+min_time = 2000
+style = "bold yellow"
+format = "took [$duration]($style) "
