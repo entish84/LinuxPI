@@ -19,6 +19,7 @@ import re
 import pwd
 import tempfile
 import argparse
+import time
 from pathlib import Path
 from abc import ABC, abstractmethod
 
@@ -94,6 +95,46 @@ def download_file(url, dest_path, headers=None):
     with urllib.request.urlopen(req, timeout=30) as resp, open(dest_path, "wb") as f:
         shutil.copyfileobj(resp, f)
 
+def extract_deb_payload(deb_path, extract_root="/"):
+    """
+    Directly extracts a Debian package data tarball into extract_root.
+    Parses Unix ar archive headers in pure Python to eliminate external ar syntax issues.
+    """
+    with open(deb_path, "rb") as f:
+        magic = f.read(8)
+        if magic != b"!<arch>\n":
+            raise ValueError(f"Invalid deb archive header: {magic}")
+
+        while True:
+            hdr = f.read(60)
+            if len(hdr) < 60:
+                break
+
+            name = hdr[:16].decode("ascii", errors="ignore").strip().rstrip("/")
+            size_str = hdr[48:58].decode("ascii", errors="ignore").strip()
+            if not size_str.isdigit():
+                break
+            size = int(size_str)
+
+            if name.startswith("data.tar"):
+                suffix = name[name.find(".tar"):]
+                data = f.read(size)
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+                    tf.write(data)
+                    tar_tmp = tf.name
+                try:
+                    run_cmd(["tar", "-xf", tar_tmp, "-C", extract_root])
+                finally:
+                    if os.path.exists(tar_tmp):
+                        os.remove(tar_tmp)
+                return True
+            else:
+                f.seek(size, os.SEEK_CUR)
+
+            if size % 2 == 1:
+                f.seek(1, os.SEEK_CUR)
+    return False
+
 def prompt_yn(prompt_msg, default_no=True, non_interactive=False):
     """Interactive Y/N prompt with fallback for non-interactive environments."""
     default_str = "y/N" if default_no else "Y/n"
@@ -143,10 +184,10 @@ def detect_distro_family():
                 if "=" in line:
                     k, v = line.strip().split("=", 1)
                     info[k] = v.strip("\"'")
-    
+
     distro_id = info.get("ID", "").lower()
     id_like = info.get("ID_LIKE", "").lower().split()
-    
+
     if distro_id in ("debian", "ubuntu", "linuxmint", "pop", "kali", "devuan") or "debian" in id_like or "ubuntu" in id_like:
         return "debian", info
     elif distro_id in ("fedora", "rhel", "almalinux", "rocky", "centos") or "fedora" in id_like or "rhel" in id_like:
@@ -217,12 +258,10 @@ class DebianDistro(BaseDistro):
     def configure_package_manager(self, config):
         log_info("Configuring APT repositories and keyrings...")
         os.environ["DEBIAN_FRONTEND"] = "noninteractive"
-        
-        # APT performance tweaks
+
         apt_conf = Path("/etc/apt/apt.conf.d/99post-install")
         apt_conf.write_text('Acquire::Languages "none";\nAcquire::Retries "3";\nAPT::Color "1";\nDpkg::Progress-Fancy "1";\n')
 
-        # Enable contrib & non-free
         deb_sources = Path("/etc/apt/sources.list.d/debian.sources")
         if deb_sources.exists():
             content = deb_sources.read_text()
@@ -234,12 +273,10 @@ class DebianDistro(BaseDistro):
             content = re.sub(r"^(deb .* main)$", r"\1 contrib non-free non-free-firmware", content, flags=re.MULTILINE)
             classic_sources.write_text(content)
 
-        # Ubuntu universe/multiverse
         if shutil.which("add-apt-repository"):
             run_cmd("add-apt-repository -y universe 2>/dev/null || true", check=False)
             run_cmd("add-apt-repository -y multiverse 2>/dev/null || true", check=False)
 
-        # Pre-seed ms fonts eula
         run_cmd("echo ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true | debconf-set-selections", check=False)
 
         run_cmd("apt-get update -y")
@@ -274,7 +311,7 @@ class DebianDistro(BaseDistro):
             "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main\n"
         )
 
-        # 4. VS Code (if selected)
+        # 4. VS Code
         if config["vscode"]:
             run_cmd("curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor --yes -o /etc/apt/keyrings/packages.microsoft.gpg")
             os.chmod("/etc/apt/keyrings/packages.microsoft.gpg", 0o644)
@@ -282,7 +319,7 @@ class DebianDistro(BaseDistro):
                 "deb [arch=amd64,arm64,armhf signed-by=/etc/apt/keyrings/packages.microsoft.gpg] https://packages.microsoft.com/repos/code stable main\n"
             )
 
-        # 5. Antigravity IDE (if selected)
+        # 5. Antigravity IDE
         if config["antigravity"]:
             run_cmd("curl -fsSL https://us-central1-apt.pkg.dev/doc/repo-signing-key.gpg | gpg --dearmor --yes -o /etc/apt/keyrings/antigravity-repo-key.gpg")
             os.chmod("/etc/apt/keyrings/antigravity-repo-key.gpg", 0o644)
@@ -299,37 +336,27 @@ class DebianDistro(BaseDistro):
     def install_system_packages(self, install_desktop_apps):
         log_info("Installing system compilers, core CLI tools, fonts, and runtimes...")
         core_pkgs = [
-            # Compilers & tools
             "git", "curl", "wget", "tar", "unzip", "7zip", "jq", "make", "cmake", "clang", "ninja-build",
-            "build-essential", "pkg-config", "xz-utils", "fontconfig", "sudo",
-            # CLI tools
+            "build-essential", "pkg-config", "xz-utils", "zstd", "binutils", "fontconfig", "sudo",
             "bat", "fd-find", "fzf", "ripgrep", "zoxide", "direnv", "micro", "btop", "inxi",
             "wl-clipboard", "xclip", "poppler-utils", "eza", "mise", "flatpak", "openssh-server",
-            # Fonts & themes
             "fonts-firacode", "fonts-inter", "papirus-icon-theme", "ttf-mscorefonts-installer",
-            # Containers & Shell
             "zsh", "podman"
         ]
         run_cmd(["apt-get", "install", "-y"] + core_pkgs, check=False)
 
-        # Docker CE
         run_cmd("apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || apt-get install -y docker.io docker-compose || true", check=False)
-
-        # Codecs & Virt
         run_cmd("apt-get install -y ffmpeg libavcodec-extra mesa-va-drivers mesa-vdpau-drivers qemu-system qemu-utils libvirt-daemon-system virt-manager || true", check=False)
 
-        # Symlinks for bat & fd
         if Path("/usr/bin/batcat").exists() and not Path("/usr/local/bin/bat").exists():
             os.symlink("/usr/bin/batcat", "/usr/local/bin/bat")
         if Path("/usr/bin/fdfind").exists() and not Path("/usr/local/bin/fd").exists():
             os.symlink("/usr/bin/fdfind", "/usr/local/bin/fd")
 
-        # Standalone binaries: Starship prompt
         if not shutil.which("starship"):
-            log_info("Installing Starship prompt...")
+            log_info("Installing Starship prompt via standalone installer...")
             run_cmd("curl -sS https://starship.rs/install.sh | sh -s -- -y", check=False)
 
-        # Desktop Apps
         if install_desktop_apps:
             log_info("Installing Desktop GUI Applications (Kitty, Foliate, qBittorrent, MPV)...")
             run_cmd("apt-get install -y kitty mpv foliate qbittorrent || true", check=False)
@@ -361,30 +388,71 @@ class FedoraDistro(BaseDistro):
             run_cmd(f"rm -f {pattern}", check=False)
         run_cmd("dnf remove -y docker docker-client docker-common containerd runc 2>/dev/null || true", check=False)
 
+    def _resolve_working_terra_ver(self, raw_ver):
+        """Finds the latest reachable Terra repository branch, falling back if unreleased."""
+        candidates = [raw_ver, "42", "41", "40"]
+        for ver in candidates:
+            url = f"https://repos.fyralabs.com/terra{ver}/repodata/repomd.xml"
+            try:
+                req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    if resp.status == 200:
+                        return ver
+            except Exception:
+                continue
+        return "41"
+
     def configure_package_manager(self, config):
         log_info("Configuring DNF settings and RPM repositories...")
-        run_cmd("dnf install -y dnf-plugins-core || true", check=False)
-        
+        run_cmd("dnf install -y dnf-plugins-core dnf5-plugins 2>/dev/null || true", check=False)
+
         dnf_conf = Path("/etc/dnf/dnf.conf")
         dnf_conf.write_text(
             "[main]\ngpgcheck=True\ninstallonly_limit=3\nclean_requirements_on_remove=True\nskip_if_unavailable=True\nmax_parallel_downloads=10\n"
         )
-        run_cmd("dnf clean all", check=False)
 
-        # 1. Terra Repository
+        fedora_ver = run_cmd(["rpm", "-E", "%fedora"], capture=True).stdout.strip() or "41"
+
+        # 1. Official Mise Repo (Avoids Terra single point of failure)
+        log_info("Enabling official Mise repository...")
+        Path("/etc/yum.repos.d/mise.repo").write_text(
+            "[mise]\nname=mise\nbaseurl=https://mise.jdx.dev/rpm\nenabled=1\ngpgcheck=1\ngpgkey=https://mise.jdx.dev/gpg-key.pub\nskip_if_unavailable=True\n"
+        )
+
+        # 2. Official Starship COPR (Guarantees Starship availability on Fedora 41-44+)
+        log_info("Enabling Starship COPR repository...")
+        run_cmd("dnf copr enable -y atim/starship 2>/dev/null || true", check=False)
+
+        # 3. Terra Repository with Verified Branch & Escaped Substitution
         if run_cmd("rpm -q terra-release", check=False).returncode != 0:
             log_info("Enabling Terra repository...")
-            run_cmd('dnf install -y --nogpgcheck --repofrompath "terra-bootstrap,https://repos.fyralabs.com/terra$releasever" terra-release || true', check=False)
+            terra_ver = self._resolve_working_terra_ver(fedora_ver)
+            log_info(f"Targeting Terra repository branch: {terra_ver}")
+            res = run_cmd(
+                f'dnf install -y --nogpgcheck --repofrompath "terra-bootstrap,https://repos.fyralabs.com/terra{terra_ver}" terra-release',
+                check=False
+            )
+            if res.returncode != 0:
+                log_warn("terra-release RPM bootstrap failed; configuring direct /etc/yum.repos.d/terra.repo fallback.")
+                Path("/etc/yum.repos.d/terra.repo").write_text(
+                    f"[terra]\nname=Terra {terra_ver}\nbaseurl=https://repos.fyralabs.com/terra{terra_ver}\nenabled=1\ngpgcheck=0\nskip_if_unavailable=True\n"
+                )
 
-        # 2. RPM Fusion
+        # 4. RPM Fusion (with rawhide/release fallback)
         log_info("Enabling RPM Fusion repositories...")
-        run_cmd('dnf install -y "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" "https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" || true', check=False)
+        fusion_cmd = (
+            f'dnf install -y "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-{fedora_ver}.noarch.rpm" '
+            f'"https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{fedora_ver}.noarch.rpm" 2>/dev/null || '
+            f'dnf install -y "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-rawhide.noarch.rpm" '
+            f'"https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-rawhide.noarch.rpm" || true'
+        )
+        run_cmd(fusion_cmd, check=False)
 
-        # 3. Docker CE
+        # 5. Docker CE
         log_info("Enabling Docker CE repository...")
         run_cmd("dnf config-manager addrepo --from-repofile https://download.docker.com/linux/fedora/docker-ce.repo 2>/dev/null || curl -fsSL https://download.docker.com/linux/fedora/docker-ce.repo -o /etc/yum.repos.d/docker-ce.repo", check=False)
 
-        # 4. VS Code (if selected)
+        # 6. VS Code (if selected)
         if config["vscode"]:
             run_cmd("rpm --import https://packages.microsoft.com/keys/microsoft.asc 2>/dev/null || true", check=False)
             Path("/etc/yum.repos.d/vscode.repo").write_text(
@@ -393,26 +461,32 @@ class FedoraDistro(BaseDistro):
 
     def system_upgrade(self):
         log_info("Refreshing and upgrading DNF packages...")
-        run_cmd("dnf upgrade --refresh -y")
+        run_cmd("dnf upgrade --refresh -y --skip-unavailable")
 
     def install_system_packages(self, install_desktop_apps):
         log_info("Installing packages via DNF...")
         pkgs = [
-            # Compilers & core
-            "git", "curl", "wget", "tar", "unzip", "p7zip", "p7zip-plugins", "jq", "xz", "fontconfig", "sudo",
-            "make", "cmake", "clang", "ninja-build",
-            # CLI tools
+            "git", "curl", "wget", "tar", "unzip", "p7zip", "p7zip-plugins", "jq", "xz", "zstd", "binutils",
+            "fontconfig", "sudo", "make", "cmake", "clang", "ninja-build",
             "eza", "bat", "fzf", "ripgrep", "fd-find", "zoxide", "yazi", "direnv", "micro", "btop",
             "fastfetch", "inxi", "wl-clipboard", "xclip", "poppler-utils", "starship", "atuin", "mise",
             "flatpak", "openssh-server",
-            # Fonts & themes
             "firacode-nerd-fonts", "rsms-inter-vf-fonts", "0xproto-nerd-fonts", "papirus-icon-theme",
-            # Container & Shell
             "zsh", "podman"
         ]
         run_cmd(["dnf", "install", "-y", "--skip-unavailable"] + pkgs, check=False)
 
-        # Docker CE
+        # Standalone Mise fallback
+        if not shutil.which("mise"):
+            log_info("Installing Mise via official standalone installer...")
+            run_cmd("curl -fsSL https://mise.jdx.dev/install.sh | MISE_INSTALL_PATH=/usr/local/bin/mise sh", check=False)
+
+        # Standalone Starship fallback
+        if not shutil.which("starship"):
+            log_info("Installing Starship prompt via official installer...")
+            run_cmd("curl -sS https://starship.rs/install.sh | sh -s -- -y", check=False)
+
+        # Docker CE / Moby
         run_cmd("dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || dnf install -y moby-engine docker-compose || true", check=False)
 
         # Multimedia & Codecs
@@ -425,7 +499,6 @@ class FedoraDistro(BaseDistro):
         run_cmd("dnf install -y curl cabextract xorg-x11-font-utils fontconfig || true", check=False)
         run_cmd("rpm -i https://downloads.sourceforge.net/project/mscorefonts2/rpms/msttcore-fonts-installer-2.6-1.noarch.rpm 2>/dev/null || true", check=False)
 
-        # Desktop Apps
         if install_desktop_apps:
             log_info("Installing Desktop GUI Applications (Kitty, Foliate, qBittorrent, MPV)...")
             run_cmd("dnf install -y --skip-unavailable kitty mpv foliate qbittorrent || true", check=False)
@@ -436,27 +509,71 @@ class FedoraDistro(BaseDistro):
 
     def install_antigravity(self):
         log_info("Installing Google Antigravity IDE...")
-        # Check if native rpm or copr exists, else extract official deb package payload
         if run_cmd("dnf install -y antigravity 2>/dev/null", check=False).returncode == 0:
+            log_success("Installed Antigravity natively from RPM repository.")
             return
-        log_info("Extracting Antigravity Linux package to /opt/antigravity...")
-        deb_url = "https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev/pool/main/a/antigravity/antigravity_1.23.2-1776332190_amd64.deb"
-        tmp_deb = "/tmp/antigravity.deb"
-        tmp_extract = "/tmp/antigravity_extract"
+
+        log_info("Resolving latest Antigravity package from Google Cloud Repository...")
+        repo_base = "https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev"
+        deb_url = f"{repo_base}/pool/main/a/antigravity/antigravity_1.23.2-1776332190_amd64.deb"
+
         try:
+            packages_url = f"{repo_base}/dists/antigravity-debian/main/binary-amd64/Packages"
+            req = urllib.request.Request(packages_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                pkg_text = resp.read().decode("utf-8", errors="ignore")
+                match = re.search(r"^Filename:\s*(pool/main/.*\.deb)", pkg_text, re.MULTILINE)
+                if match:
+                    deb_url = f"{repo_base}/{match.group(1).strip()}"
+        except Exception as e:
+            log_warn(f"Could not scrape latest index, using pinned release URL: {e}")
+
+        tmp_deb = "/tmp/antigravity.deb"
+        try:
+            log_info(f"Downloading Antigravity package from {deb_url}...")
             download_file(deb_url, tmp_deb)
-            Path(tmp_extract).mkdir(parents=True, exist_ok=True)
-            run_cmd(f"ar x {tmp_deb} --output {tmp_extract}")
-            data_tar = list(Path(tmp_extract).glob("data.tar.*"))[0]
-            run_cmd(f"tar -xf {data_tar} -C /")
-            run_cmd("chmod -R 755 /opt/antigravity 2>/dev/null || true", check=False)
-            if not Path("/usr/local/bin/antigravity").exists() and Path("/usr/bin/antigravity").exists():
-                os.symlink("/usr/bin/antigravity", "/usr/local/bin/antigravity")
+
+            log_info("Extracting Antigravity package payload directly to root filesystem...")
+            if not extract_deb_payload(tmp_deb, extract_root="/"):
+                raise RuntimeError("Failed to locate or unpack data.tar archive inside .deb")
+
+            # Binary path resolution
+            bin_candidates = [
+                "/usr/bin/antigravity",
+                "/opt/antigravity/antigravity",
+                "/opt/antigravity/bin/antigravity"
+            ]
+            actual_bin = next((b for b in bin_candidates if os.path.exists(b)), None)
+
+            if actual_bin:
+                os.chmod(actual_bin, 0o755)
+                if actual_bin != "/usr/local/bin/antigravity" and not Path("/usr/local/bin/antigravity").exists():
+                    os.symlink(actual_bin, "/usr/local/bin/antigravity")
+                if actual_bin != "/usr/bin/antigravity" and not Path("/usr/bin/antigravity").exists():
+                    os.symlink(actual_bin, "/usr/bin/antigravity")
+
+            # Desktop launcher generation
+            desktop_file = Path("/usr/share/applications/antigravity.desktop")
+            if not desktop_file.exists() and actual_bin:
+                icon_candidates = list(Path("/opt/antigravity").glob("**/*.png")) + list(Path("/opt/antigravity").glob("**/*.svg"))
+                icon_path = str(icon_candidates[0]) if icon_candidates else "utilities-terminal"
+                desktop_file.write_text(f"""[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Google Antigravity IDE
+Exec="{actual_bin}" %F
+Icon={icon_path}
+Comment=Next-generation Cloud & AI IDE
+Categories=Development;IDE;
+Terminal=false
+StartupWMClass=antigravity
+""")
+                os.chmod(desktop_file, 0o644)
+
             log_success("Google Antigravity IDE successfully deployed to /opt/antigravity")
         except Exception as e:
-            log_warn(f"Failed to extract Antigravity deb payload: {e}")
+            log_error(f"Failed to deploy Google Antigravity IDE: {e}")
         finally:
-            shutil.rmtree(tmp_extract, ignore_errors=True)
             if os.path.exists(tmp_deb):
                 os.remove(tmp_deb)
 
@@ -485,7 +602,6 @@ class ArchDistro(BaseDistro):
                 text = text.replace("#ParallelDownloads = 5", "ParallelDownloads = 10")
             elif "ParallelDownloads" not in text:
                 text = text.replace("[options]\n", "[options]\nParallelDownloads = 10\nColor\n")
-            # Enable multilib
             text = re.sub(r"#\[multilib\]\n#Include = /etc/pacman\.d/mirrorlist", "[multilib]\nInclude = /etc/pacman.d/mirrorlist", text)
             pac_conf.write_text(text)
 
@@ -512,29 +628,22 @@ class ArchDistro(BaseDistro):
     def install_system_packages(self, install_desktop_apps):
         log_info("Installing packages via Pacman...")
         pkgs = [
-            # Compilers & core
-            "base-devel", "git", "curl", "wget", "tar", "unzip", "p7zip", "jq", "xz", "fontconfig", "sudo",
-            "make", "cmake", "clang", "ninja", "pkgconf",
-            # CLI tools
+            "base-devel", "git", "curl", "wget", "tar", "unzip", "p7zip", "jq", "xz", "zstd", "binutils",
+            "fontconfig", "sudo", "make", "cmake", "clang", "ninja", "pkgconf",
             "eza", "bat", "fzf", "ripgrep", "fd", "zoxide", "yazi", "direnv", "micro", "btop",
             "fastfetch", "inxi", "wl-clipboard", "xclip", "poppler", "starship", "atuin",
             "flatpak", "openssh",
-            # Fonts & themes
             "ttf-fira-code", "ttf-inter", "papirus-icon-theme",
-            # Multimedia & Virt
             "ffmpeg", "qemu-desktop", "virt-manager", "libvirt",
-            # Container & Shell
             "zsh", "podman", "docker", "docker-compose", "docker-buildx"
         ]
         run_cmd(["pacman", "-S", "--noconfirm", "--needed"] + pkgs, check=False)
 
-        # AUR packages
         helper = self._ensure_aur_helper()
         if helper:
             log_info(f"Installing AUR tools (mise-bin) via {helper}...")
             run_cmd(f"{helper} -S --noconfirm --needed mise-bin ttf-ms-fonts || true", as_user=self.target_user, check=False)
 
-        # Desktop Apps
         if install_desktop_apps:
             log_info("Installing Desktop GUI Applications (Kitty, Foliate, qBittorrent, MPV)...")
             run_cmd("pacman -S --noconfirm --needed kitty mpv foliate qbittorrent || true", check=False)
@@ -572,6 +681,26 @@ class UniversalCore:
         self.target_uid = target_uid
         self.target_gid = target_gid
 
+    def _safe_deploy(self, src_file: Path, dst_file: Path):
+        """Copies dotfile with automatic backup and strict ownership management."""
+        if not src_file.exists():
+            return
+
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        os.chown(dst_file.parent, self.target_uid, self.target_gid)
+
+        # Create timestamped backup if destination exists
+        if dst_file.exists():
+            backup_path = dst_file.with_suffix(f"{dst_file.suffix}.bak-{int(time.time())}")
+            shutil.copy2(dst_file, backup_path)
+            os.chown(backup_path, self.target_uid, self.target_gid)
+            log_info(f"Existing file backed up: {backup_path}")
+
+        shutil.copy2(src_file, dst_file)
+        os.chown(dst_file, self.target_uid, self.target_gid)
+        os.chmod(dst_file, 0o644)
+        log_info(f"Deployed: {dst_file}")
+
     def deploy_dotfiles(self, install_desktop_apps):
         log_section("Deploying Fixed Dotfiles")
         dotfiles_dir = self.script_dir / "dotfiles"
@@ -579,49 +708,22 @@ class UniversalCore:
             log_warn(f"Dotfiles directory {dotfiles_dir} not found. Skipping dotfiles.")
             return
 
-        # 1. ~/.zshrc
-        zshrc = dotfiles_dir / "zsh" / ".zshrc"
-        if zshrc.exists():
-            dst = self.target_home / ".zshrc"
-            shutil.copy2(zshrc, dst)
-            os.chown(dst, self.target_uid, self.target_gid)
-            os.chmod(dst, 0o644)
-            log_info(f"Deployed fixed dotfile: {dst}")
+        # 1. Shell configs
+        self._safe_deploy(dotfiles_dir / "zsh" / ".zshrc", self.target_home / ".zshrc")
+        self._safe_deploy(dotfiles_dir / "zsh" / ".zsh_aliases", self.target_home / ".zsh_aliases")
 
-        # 2. ~/.zsh_aliases
-        aliases = dotfiles_dir / "zsh" / ".zsh_aliases"
-        if aliases.exists():
-            dst = self.target_home / ".zsh_aliases"
-            shutil.copy2(aliases, dst)
-            os.chown(dst, self.target_uid, self.target_gid)
-            os.chmod(dst, 0o644)
-            log_info(f"Deployed fixed dotfile: {dst}")
+        # 2. Starship prompt
+        self._safe_deploy(dotfiles_dir / "starship" / "starship.toml", self.target_home / ".config" / "starship.toml")
 
-        # 3. ~/.config/starship.toml
-        starship_src = dotfiles_dir / "starship" / "starship.toml"
-        if starship_src.exists():
-            cfg_dir = self.target_home / ".config"
-            cfg_dir.mkdir(parents=True, exist_ok=True)
-            os.chown(cfg_dir, self.target_uid, self.target_gid)
-            dst = cfg_dir / "starship.toml"
-            shutil.copy2(starship_src, dst)
-            os.chown(dst, self.target_uid, self.target_gid)
-            os.chmod(dst, 0o644)
-            log_info(f"Deployed fixed dotfile: {dst}")
-
-        # 4. ~/.config/kitty/ (if Desktop Apps enabled or kitty is installed)
+        # 3. Kitty Terminal
         if install_desktop_apps or shutil.which("kitty"):
             kitty_src = dotfiles_dir / "kitty"
             if kitty_src.exists():
                 kitty_dst = self.target_home / ".config" / "kitty"
                 kitty_dst.mkdir(parents=True, exist_ok=True)
-                for conf in kitty_src.glob("*.conf"):
-                    dst_file = kitty_dst / conf.name
-                    shutil.copy2(conf, dst_file)
-                    os.chown(dst_file, self.target_uid, self.target_gid)
-                    os.chmod(dst_file, 0o644)
                 os.chown(kitty_dst, self.target_uid, self.target_gid)
-                log_info(f"Deployed fixed Kitty configuration: {kitty_dst}")
+                for conf in kitty_src.glob("*.conf"):
+                    self._safe_deploy(conf, kitty_dst / conf.name)
 
     def bootstrap_zinit(self):
         log_section("Bootstrapping Zinit Plugin Manager")
@@ -755,13 +857,14 @@ StartupWMClass=jetbrains-studio
 
     def configure_mise(self):
         log_section("Configuring Mise Global Developer Runtimes")
-        if shutil.which("mise"):
+        mise_bin = shutil.which("mise") or "/usr/local/bin/mise"
+        if os.path.exists(mise_bin):
             log_info("Setting up dotnet@10, node@latest, and java@lts via Mise...")
-            run_cmd("mise settings set idiomatic_version_file false 2>/dev/null || true", as_user=self.target_user, check=False)
-            run_cmd("mise settings set yes true 2>/dev/null || true", as_user=self.target_user, check=False)
-            run_cmd("mise use --global dotnet@10 node@latest java@lts 2>/dev/null || true", as_user=self.target_user, check=False)
+            run_cmd(f"'{mise_bin}' settings set idiomatic_version_file false 2>/dev/null || true", as_user=self.target_user, check=False)
+            run_cmd(f"'{mise_bin}' settings set yes true 2>/dev/null || true", as_user=self.target_user, check=False)
+            run_cmd(f"'{mise_bin}' use --global dotnet@10 node@latest java@lts 2>/dev/null || true", as_user=self.target_user, check=False)
         else:
-            log_warn("Mise runtime manager not found in PATH.")
+            log_warn("Mise runtime manager not found in PATH or /usr/local/bin/mise.")
 
     def setup_ssh_key(self):
         log_section("Configuring User SSH Keys")
@@ -842,7 +945,6 @@ def resolve_configuration(args):
             if config[ide_key] is None:
                 config[ide_key] = args.ides
 
-    # 1. Desktop Applications Prompt
     if config["desktop_apps"] is None:
         print()
         config["desktop_apps"] = prompt_yn(
@@ -851,7 +953,6 @@ def resolve_configuration(args):
             non_interactive=non_interactive
         )
 
-    # 2. IDE Prompts
     ide_keys_unset = [k for k in ["vscode", "antigravity", "rider", "studio"] if config[k] is None]
     if ide_keys_unset:
         print()
@@ -872,7 +973,6 @@ def resolve_configuration(args):
             for k in ide_keys_unset:
                 config[k] = False
 
-    # Fallback any unassigned values to False
     for k in config:
         if config[k] is None:
             config[k] = False
@@ -889,6 +989,7 @@ def main():
         log_error("This script must be run with root privileges (sudo).")
         log_info("Usage: sudo python3 install.py [OPTIONS]")
         sys.exit(1)
+
     target_user = get_target_user()
     try:
         user_info = pwd.getpwnam(target_user)
@@ -913,7 +1014,6 @@ def main():
 
     config, non_interactive = resolve_configuration(args)
 
-    # Configuration Summary
     def fmt_bool(val):
         return f"{Colors.GREEN}YES{Colors.RESET}" if val else f"{Colors.YELLOW}NO{Colors.RESET}"
 
@@ -925,7 +1025,6 @@ def main():
     print(f" Android Studio:                         {fmt_bool(config['studio'])}")
     print("=" * 68)
 
-    # Instantiate Distro Adapter
     adapter = None
     if distro_family == "debian":
         adapter = DebianDistro(target_user, target_home, os_info)
@@ -979,7 +1078,7 @@ def main():
     core.setup_ssh_key()
     core.configure_shell()
 
-    # Distro Post-Setup (Services & Groups)
+    # Distro Post-Setup
     log_section("6. Post-Installation Services & User Groups")
     adapter.post_system_setup()
     run_cmd("update-desktop-database /usr/share/applications 2>/dev/null || true", check=False)
@@ -997,15 +1096,17 @@ def main():
     print(f" • Android Studio:        {'Installed' if config['studio'] else 'Skipped'}")
     print("=" * 68)
 
-    # Prompt Reboot
+    print(f"\n{Colors.GREEN}{Colors.BOLD}To activate your new shell, groups, and dotfiles immediately without rebooting, run:{Colors.RESET}")
+    print(f"  {Colors.CYAN}exec sg docker -c \"exec zsh -l\"{Colors.RESET}\n")
+
     if not non_interactive:
-        if prompt_yn("It is recommended to reboot the machine now. Would you like to reboot?", default_no=True):
+        if prompt_yn("Would you like to reboot now to finalize all system daemon and session changes?", default_no=True):
             log_info("Rebooting system...")
             run_cmd("reboot 2>/dev/null || systemctl reboot 2>/dev/null || echo 'Please reboot manually.'", check=False)
         else:
-            log_info("Reboot canceled. Please restart your session or reboot when convenient.")
+            log_info("Reboot skipped. Please execute the command above to refresh your active session.")
     else:
-        log_info("Non-interactive run completed. Please reboot when convenient.")
+        log_info("Non-interactive run completed.")
 
 if __name__ == "__main__":
     main()
